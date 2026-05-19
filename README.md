@@ -2,10 +2,12 @@
 
 Autonomous astrophotography orchestrator for N.I.N.A. (Nighttime Imaging 'N' Astronomy).
 
-Status: **Phase 4 — supervised lights-out ready**. Adds a web dashboard,
-nightly LLM-spend circuit breaker, full Doctor action coverage (RETRY / REPLAN
-/ PARK_AND_WAIT / ABORT), and E-STOP routed through the dashboard. The human
-can now watch a real session unattended.
+Status: **Phase 4.1 — Operator + Scout (rule-based) shipped**. Phase 4 added
+web dashboard, nightly LLM-spend circuit breaker, full Doctor action coverage
+(RETRY / REPLAN / PARK_AND_WAIT / ABORT), and dashboard-routed E-STOP. Phase
+4.1 added the per-sub Operator and the world-state Scout — both rule-based
+(zero LLM tokens in steady state) and standalone for now; Conductor wiring
+comes in a follow-up turn.
 
 The full architecture spec lives at
 `%USERPROFILE%\.claude\plans\you-are-an-expert-linked-quiche.md`.
@@ -60,9 +62,28 @@ The full architecture spec lives at
   `conductor.request_stop()`; the next imaging tick picks it up and runs the
   normal close-down chain.
 
+**Phase 4.1 — Operator + Scout (NEW):**
+- **Operator** ([`operator.py`](src/nina_autopilot/operator.py)) — per-sub
+  image-quality decider. Inputs `SubFrameStats` (HFR, star count, guide RMS,
+  mean ADU); returns `OperatorDecision` in `{ACCEPT, RESHOOT, REQUEST_AF,
+  REQUEST_DITHER}`. Maintains a rolling HFR baseline (default 10 subs) to
+  catch focus drift without per-night calibration. Rule priority:
+  hard reshoot rules (HFR over max / low star count / catastrophic guide RMS)
+  → focus-drift AF request → mild-guide dither suggestion → ACCEPT. Standalone
+  for now; Conductor wiring waits on per-sub event subscription.
+- **Scout** ([`scout.py`](src/nina_autopilot/scout.py)) — world-state delta
+  detector. Takes successive `SafetyReading` snapshots, emits compact
+  human-readable `ScoutSummary` (text + severity OK/WARN/ALERT + per-field
+  prev→cur pairs). Per-field noise floors prevent jiggle from spamming the
+  log. Severity-promotion rules: safety-monitor flips false → ALERT;
+  rain appears → ALERT; power-loss → ALERT; signal disappears → WARN;
+  numeric crossing of a warn threshold → WARN.
+
 **Still deliberately NOT here yet:**
-- Scout / Operator agents — useful but not blocking lights-out; the dashboard
-  + event log already give the human visibility. Coming in 4.1.
+- LLM second-opinion for Operator / Scout — wired only when token budget allows.
+- Operator/Scout integration into the Conductor imaging loop — needs per-sub
+  IMAGE-SAVE event polling against NINA's event-websocket (Phase 1 has the
+  infrastructure in `nina_mcp_server`; wiring to `nina.autopilot` is next).
 - LLM-smart Planner (altitude/moon/weather scoring) — algorithmic Planner is
   sufficient for TS-driven setups.
 - Sequencer JSON synthesis — relies on user's pre-saved TS-driven NINA sequence.
@@ -158,10 +179,12 @@ src/nina_autopilot/
 ├── safety.py        # pure rule engine (SafetyDecision)
 ├── planner.py       # Phase 3: TS DB → PlannerDecision (algorithmic)
 ├── doctor.py        # Phase 3: LLM fault diagnosis (single-turn JSON out)
+├── operator.py      # Phase 4.1: per-sub quality decision (rule-based)
+├── scout.py         # Phase 4.1: world-state delta summaries (rule-based)
 ├── llm.py           # Phase 3+4: Anthropic wrapper, prompt caching, budget circuit breaker
 ├── dashboard.py     # Phase 4: FastAPI app — /api/status, /api/events, /api/estop, /
 ├── nina_client.py   # NinaClient Protocol + FakeNinaClient
-├── http_client.py   # production NINA HTTP impl (now incl. unpark_mount)
+├── http_client.py   # production NINA HTTP impl (incl. unpark_mount)
 ├── state.py         # SQLite session store
 ├── config.py        # env-driven Config (incl. dashboard + budget settings)
 └── __main__.py      # CLI entrypoint — launches Conductor + dashboard concurrently
@@ -172,6 +195,8 @@ tests/
 ├── test_state.py                   # 9 tests, session store
 ├── test_planner.py                 # 7 tests, TS DB Planner
 ├── test_doctor.py                  # 15 tests, LLM Doctor (fake Anthropic)
+├── test_operator.py                # 17 tests, per-sub Operator
+├── test_scout.py                   # 13 tests, world-state Scout
 ├── test_llm.py                     # 8 tests, LLM wrapper + prompt caching
 ├── test_budget.py                  # 7 tests, nightly-budget circuit breaker
 ├── test_dashboard.py               # 9 tests, FastAPI endpoints via httpx ASGI client
@@ -186,7 +211,7 @@ tests/
 py -m pytest tests/ -v
 ```
 
-**116 tests, all green** (Phase 1 in `nina_mcp_server` + Phase 2–4 in this repo).
+**146 tests, all green** (Phase 1 in `nina_mcp_server` + Phase 2–4.1 in this repo).
 
 Headline gates:
 - `test_phase2_exit_criterion.py` — injects UNSAFE rain mid-IMAGING; close-down + PANIC alert.
@@ -199,12 +224,15 @@ Headline gates:
 
 ## Next
 
-**Phase 4.1 (carry-over):**
-- **Operator** agent — wire `nina_mcp_server`'s `nina_poll_events_since` for per-sub
-  IMAGE-SAVE events, decide ACCEPT / RESHOOT / REQUEST_AF on rolling HFR/star-count
-  baselines. Rule-based primary path, LLM second-opinion when confidence is low.
-- **Scout** agent — translate weather/safety signal changes into human-readable
-  world-state deltas for the dashboard (local Ollama to stay free).
+**Phase 4.2 (carry-over):**
+- Wire **Operator** into the imaging loop — poll NINA's
+  `nina_get_capture_statistics` or subscribe to IMAGE-SAVE events (Phase 1
+  infrastructure already exists in `nina_mcp_server`) and feed each sub's
+  stats to `Operator.evaluate()`.
+- Wire **Scout** into the Conductor's safety/weather tick — emit summaries
+  to the session log and post WARN/ALERT summaries to Discord.
+- Optional LLM second-opinion for both: local Ollama default, Haiku escalation
+  on ambiguous cases (gated by budget circuit breaker).
 
 **Phase 5 — In-NINA panel:**
 - `nina.plugin.aiassistant` mode toggle: Standalone Chat ↔ Connected to Orchestrator.
