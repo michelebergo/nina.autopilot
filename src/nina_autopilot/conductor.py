@@ -28,6 +28,7 @@ from .llm import BudgetExceeded
 from .nina_client import NinaClient
 from .planner import PlannerAction, PlannerDecision
 from .safety import SafetyDecision, SafetyLevel, SafetyThresholds, evaluate
+from .scout import ScoutSeverity
 from .state import SessionStore
 
 
@@ -59,6 +60,8 @@ class ConductorConfig:
     planner: Optional[Callable[[], Any]] = None  # sync or async; runs at session start
     doctor: Optional[Any] = None  # any object with `async def diagnose(ctx) -> DoctorDecision`
     max_retries: int = 2  # cap on Doctor RETRY actions before forced abort
+    operator: Optional[Any] = None  # any object with `evaluate(SubFrameStats) -> OperatorDecision`
+    scout: Optional[Any] = None     # any object with `observe(SafetyReading) -> ScoutSummary`
 
     def __post_init__(self):
         if self.sequence_file is None and self.planner is None:
@@ -86,6 +89,9 @@ class Conductor:
         self._stop_requested = False
         self._session_id: Optional[int] = None
         self._retry_count = 0
+        # Phase 4.2 — Operator / Scout state
+        self._last_operator_sub_index: int = -1
+        self._scout_obs_count = 0
 
     @property
     def phase(self) -> Phase:
@@ -158,6 +164,11 @@ class Conductor:
         while True:
             # 1) Safety first — pre-empts everything else.
             reading = await self._client.get_safety_reading()
+
+            # 1.5) Scout — observation layer (must run BEFORE the abort path so
+            # it sees the same reading the supervisor judges).
+            await self._run_scout(reading)
+
             decision = evaluate(reading, self._config.thresholds)
             if decision.is_unsafe:
                 self._record_safety(decision)
@@ -184,8 +195,70 @@ class Conductor:
                 continue_imaging = await self._handle_fault(seq_state)
                 if not continue_imaging:
                     return
+                # Restart the loop: don't run Operator on the fault tick.
+                continue
+
+            # 4) Operator — per-sub quality decision (only when imaging is healthy)
+            await self._run_operator()
 
             await self._sleep(self._config.safety_tick_s)
+
+    async def _run_scout(self, reading) -> None:
+        """Feed the latest safety reading to the Scout, if one is configured.
+
+        Logs SCOUT_SUMMARY only when something is worth recording (initial
+        observation, signals changed, or non-OK severity) to keep the event
+        log clean during quiet stretches.
+        """
+        if self._config.scout is None:
+            return
+        try:
+            summary = self._config.scout.observe(reading)
+        except Exception as e:
+            logger.warning("scout.observe() failed: %s", e)
+            return
+        self._scout_obs_count += 1
+        is_first = self._scout_obs_count == 1
+        non_quiet = bool(summary.signals_changed) or summary.severity is not ScoutSeverity.OK
+        if is_first or non_quiet:
+            self._record_event("SCOUT_SUMMARY", summary.to_dict())
+        # Promote ALERT-severity summaries to Discord alerts so the human sees them
+        # even if they're not watching the dashboard.
+        if summary.severity is ScoutSeverity.ALERT:
+            await self._safe_call(
+                "alert",
+                self._client.alert(severity="alert", message=summary.text),
+            )
+
+    async def _run_operator(self) -> None:
+        """Fetch the latest sub stats and run Operator on any NEW sub.
+
+        Operator decisions are advisory in Phase 4.2 — logged to the session
+        event log so the dashboard and post-session review can see them, but
+        no automatic action is taken (NINA's sequencer handles real-time
+        retries / AF / dither via its own triggers per the wiki's
+        'sequencer = real-time loop' principle).
+        """
+        if self._config.operator is None:
+            return
+        sub = await self._client.get_latest_sub_stats()
+        if sub is None:
+            return
+        index = sub.get("index")
+        if index is None or index <= self._last_operator_sub_index:
+            return
+        self._last_operator_sub_index = index
+        try:
+            decision = self._config.operator.evaluate(sub["stats"])
+        except Exception as e:
+            logger.warning("operator.evaluate() failed: %s", e)
+            return
+        self._record_event("OPERATOR_DECISION", {
+            "sub_index": index,
+            "action": decision.action.value,
+            "reason": decision.reason,
+            "metrics": decision.metrics,
+        })
 
     async def _phase_aborting(self) -> None:
         # Stop the sequence first (best-effort)

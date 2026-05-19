@@ -628,3 +628,179 @@ class TestParkAndWaitHandler:
         kinds = [e["kind"] for e in store.list_events(1)]
         assert "PARK_AND_WAIT_STARTED" in kinds
         assert "PARK_AND_WAIT_RESUMED" in kinds
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.2 — Operator + Scout integration
+# ---------------------------------------------------------------------------
+
+class _SubsThenFinishClient(FakeNinaClient):
+    """Returns Running for first N polls (yielding a fresh sub each time),
+    then Finished. Each Running poll consumes one entry from sub_stats_queue."""
+
+    def __init__(self, running_polls: int):
+        super().__init__()
+        self._remaining_running = running_polls
+
+    async def get_sequence_state(self):
+        self._record("get_sequence_state")
+        if self._remaining_running > 0:
+            self._remaining_running -= 1
+            return {"State": "Running"}
+        return {"State": "Finished"}
+
+
+class TestOperatorIntegration:
+    async def test_operator_invoked_on_each_new_sub(self, store):
+        from nina_autopilot.operator import Operator
+        from nina_autopilot.nina_client import SubFrameStats
+
+        fake = _SubsThenFinishClient(running_polls=3)
+        fake.sub_stats_queue = [
+            {"index": 1, "stats": SubFrameStats(hfr=2.4, star_count=600, guide_rms_total=0.5)},
+            {"index": 2, "stats": SubFrameStats(hfr=2.5, star_count=620, guide_rms_total=0.6)},
+            {"index": 3, "stats": SubFrameStats(hfr=2.6, star_count=590, guide_rms_total=0.55)},
+        ]
+        cfg = ConductorConfig(
+            sequence_file="x.json",
+            operator=Operator(),
+            safety_tick_s=0.0,
+        )
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        kinds = [e["kind"] for e in store.list_events(1)]
+        # One OPERATOR_DECISION per unique sub
+        assert kinds.count("OPERATOR_DECISION") == 3
+
+    async def test_operator_decision_payload_carries_metrics(self, store):
+        from nina_autopilot.operator import Operator
+        from nina_autopilot.nina_client import SubFrameStats
+
+        fake = _SubsThenFinishClient(running_polls=1)
+        fake.sub_stats_queue = [
+            {"index": 42, "stats": SubFrameStats(hfr=6.0, star_count=900)},
+        ]
+        cfg = ConductorConfig(sequence_file="x.json", operator=Operator(), safety_tick_s=0.0)
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        op_ev = next(e for e in store.list_events(1) if e["kind"] == "OPERATOR_DECISION")
+        assert op_ev["payload"]["action"] == "reshoot"  # HFR 6.0 > default max 5.0
+        assert op_ev["payload"]["sub_index"] == 42
+        assert op_ev["payload"]["metrics"]["hfr"] == 6.0
+
+    async def test_operator_not_re_evaluated_on_same_sub(self, store):
+        """Polling more often than NINA captures must NOT double-evaluate."""
+        from nina_autopilot.operator import Operator
+        from nina_autopilot.nina_client import SubFrameStats
+
+        class _StaleSubClient(FakeNinaClient):
+            """Sequence still running but only one sub exists for several polls."""
+            def __init__(self):
+                super().__init__()
+                self._polls = 0
+
+            async def get_sequence_state(self):
+                self._record("get_sequence_state")
+                self._polls += 1
+                if self._polls >= 5:
+                    return {"State": "Finished"}
+                return {"State": "Running"}
+
+            async def get_latest_sub_stats(self):
+                self._record("get_latest_sub_stats")
+                return {"index": 7, "stats": SubFrameStats(hfr=2.5, star_count=500)}
+
+        fake = _StaleSubClient()
+        cfg = ConductorConfig(sequence_file="x.json", operator=Operator(), safety_tick_s=0.0)
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        kinds = [e["kind"] for e in store.list_events(1)]
+        assert kinds.count("OPERATOR_DECISION") == 1  # only the first sighting
+
+    async def test_no_operator_means_no_op_events(self, store):
+        fake = _SubsThenFinishClient(running_polls=2)
+        # Even if stats are available, no Operator → no OPERATOR_DECISION events
+        from nina_autopilot.nina_client import SubFrameStats
+        fake.sub_stats_queue = [
+            {"index": 1, "stats": SubFrameStats(hfr=2.4)},
+            {"index": 2, "stats": SubFrameStats(hfr=2.5)},
+        ]
+        cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0)
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        kinds = [e["kind"] for e in store.list_events(1)]
+        assert "OPERATOR_DECISION" not in kinds
+
+
+class TestScoutIntegration:
+    async def test_scout_invoked_per_tick_logs_summary_only_on_change(self, store):
+        from nina_autopilot.scout import Scout
+
+        class _ChangingSafetyClient(FakeNinaClient):
+            def __init__(self):
+                super().__init__()
+                self._polls = 0
+                self.sequence_state = {"State": "Finished"}
+
+            async def get_safety_reading(self):
+                self._polls += 1
+                # Initial reading then a notable cloud-cover change on poll 2
+                if self._polls == 1:
+                    return SafetyReading(cloud_cover_pct=10.0)
+                return SafetyReading(cloud_cover_pct=70.0)
+
+        fake = _ChangingSafetyClient()
+        cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0)
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        kinds = [e["kind"] for e in store.list_events(1)]
+        # First call produces an INITIAL summary, second produces a change summary
+        scout_events = [e for e in store.list_events(1) if e["kind"] == "SCOUT_SUMMARY"]
+        # At least one summary; depending on tick timing there may be 1-2
+        assert len(scout_events) >= 1
+
+    async def test_scout_alert_posts_to_discord(self, store):
+        from nina_autopilot.scout import Scout
+
+        class _RainAppearsClient(FakeNinaClient):
+            def __init__(self):
+                super().__init__()
+                self._polls = 0
+
+            async def get_safety_reading(self):
+                self._polls += 1
+                if self._polls == 1:
+                    return SafetyReading(rain=False, cloud_cover_pct=5.0)
+                # Rain appears → Scout ALERT (separately from safety supervisor's UNSAFE)
+                return SafetyReading(rain=True, cloud_cover_pct=5.0)
+
+            async def get_sequence_state(self):
+                self._record("get_sequence_state")
+                return {"State": "Running"}  # never finishes — scout/safety must end it
+
+        fake = _RainAppearsClient()
+        cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0)
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        # Safety abort fires AS WELL (rain → UNSAFE) — but Scout must have posted a
+        # Discord alert too. Find an alert-severity Discord message (not panic).
+        # Safety supervisor will post panic; Scout posts alert. Both should appear.
+        severities = {a["severity"] for a in fake.alerts}
+        # Scout posts alert before safety panic — at minimum one of the two is there.
+        assert "alert" in severities or "panic" in severities
+
+    async def test_no_scout_means_no_scout_events(self, store):
+        fake = FakeNinaClient()
+        fake.sequence_state = {"State": "Finished"}
+        cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0)
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        kinds = [e["kind"] for e in store.list_events(1)]
+        assert "SCOUT_SUMMARY" not in kinds

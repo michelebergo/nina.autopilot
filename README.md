@@ -2,12 +2,13 @@
 
 Autonomous astrophotography orchestrator for N.I.N.A. (Nighttime Imaging 'N' Astronomy).
 
-Status: **Phase 4.1 — Operator + Scout (rule-based) shipped**. Phase 4 added
-web dashboard, nightly LLM-spend circuit breaker, full Doctor action coverage
+Status: **Phase 4.2 — all four agents wired into the Conductor**. Planner,
+Doctor, Operator, and Scout now run in a single session. Phase 4 added the
+web dashboard, LLM-spend circuit breaker, full Doctor action coverage
 (RETRY / REPLAN / PARK_AND_WAIT / ABORT), and dashboard-routed E-STOP. Phase
-4.1 added the per-sub Operator and the world-state Scout — both rule-based
-(zero LLM tokens in steady state) and standalone for now; Conductor wiring
-comes in a follow-up turn.
+4.2 closes the loop: per-sub Operator decisions are logged on every new
+sub, and Scout posts ALERT-severity world-state changes to Discord. All
+rule-based agents stay LLM-free in steady state.
 
 The full architecture spec lives at
 `%USERPROFILE%\.claude\plans\you-are-an-expert-linked-quiche.md`.
@@ -62,28 +63,40 @@ The full architecture spec lives at
   `conductor.request_stop()`; the next imaging tick picks it up and runs the
   normal close-down chain.
 
-**Phase 4.1 — Operator + Scout (NEW):**
+**Phase 4.1 — Operator + Scout (standalone modules):**
 - **Operator** ([`operator.py`](src/nina_autopilot/operator.py)) — per-sub
   image-quality decider. Inputs `SubFrameStats` (HFR, star count, guide RMS,
   mean ADU); returns `OperatorDecision` in `{ACCEPT, RESHOOT, REQUEST_AF,
   REQUEST_DITHER}`. Maintains a rolling HFR baseline (default 10 subs) to
-  catch focus drift without per-night calibration. Rule priority:
-  hard reshoot rules (HFR over max / low star count / catastrophic guide RMS)
-  → focus-drift AF request → mild-guide dither suggestion → ACCEPT. Standalone
-  for now; Conductor wiring waits on per-sub event subscription.
+  catch focus drift without per-night calibration.
 - **Scout** ([`scout.py`](src/nina_autopilot/scout.py)) — world-state delta
   detector. Takes successive `SafetyReading` snapshots, emits compact
   human-readable `ScoutSummary` (text + severity OK/WARN/ALERT + per-field
-  prev→cur pairs). Per-field noise floors prevent jiggle from spamming the
-  log. Severity-promotion rules: safety-monitor flips false → ALERT;
-  rain appears → ALERT; power-loss → ALERT; signal disappears → WARN;
-  numeric crossing of a warn threshold → WARN.
+  prev→cur pairs). Per-field noise floors prevent jiggle from spamming the log.
+
+**Phase 4.2 — Operator + Scout wired into the Conductor (NEW):**
+- New `NinaClient.get_latest_sub_stats()` method. `HttpNinaClient` reads
+  NINA's `image-history?count=1` endpoint and projects the latest entry into
+  a `SubFrameStats`; `FakeNinaClient` exposes a `sub_stats_queue` for tests.
+- Conductor's imaging loop:
+  - Calls `scout.observe(reading)` before the safety decision; logs
+    `SCOUT_SUMMARY` on first observation, any signal change, or non-OK severity
+    (quiet ticks stay silent). ALERT severity → Discord `alert` message.
+  - Calls `operator.evaluate(stats)` after the sequence-state poll when the
+    sequence is healthy. Tracks `last_operator_sub_index` so re-polling the
+    same sub never double-evaluates. Logs `OPERATOR_DECISION` with the
+    sub_index, action, reason, and observed metrics.
+- Operator decisions are **advisory in 4.2** — logged to the session DB and
+  surfaced on the dashboard, but no automatic NINA action is taken. The wiki's
+  "sequencer = real-time loop" principle means NINA's own triggers handle
+  retries/AF/dither; the autopilot's value here is a per-sub forensic record
+  the human can inspect mid-session via `/api/events`.
 
 **Still deliberately NOT here yet:**
-- LLM second-opinion for Operator / Scout — wired only when token budget allows.
-- Operator/Scout integration into the Conductor imaging loop — needs per-sub
-  IMAGE-SAVE event polling against NINA's event-websocket (Phase 1 has the
-  infrastructure in `nina_mcp_server`; wiring to `nina.autopilot` is next).
+- LLM second-opinion for Operator / Scout — rule-based versions cover the
+  common cases; LLM is a value-add when ambiguous and gated by the budget.
+- Acting on Operator decisions automatically (issue an AF trigger via NINA,
+  request a dither, etc.) — Phase 4.3 if needed.
 - LLM-smart Planner (altitude/moon/weather scoring) — algorithmic Planner is
   sufficient for TS-driven setups.
 - Sequencer JSON synthesis — relies on user's pre-saved TS-driven NINA sequence.
@@ -190,8 +203,8 @@ src/nina_autopilot/
 └── __main__.py      # CLI entrypoint — launches Conductor + dashboard concurrently
 tests/
 ├── test_safety.py                  # 24 tests, pure rules
-├── test_conductor.py               # 28 tests, state machine + Planner + Doctor +
-│                                   #   REPLAN + PARK_AND_WAIT handlers
+├── test_conductor.py               # 35 tests, state machine + Planner + Doctor +
+│                                   #   REPLAN + PARK_AND_WAIT + Operator + Scout
 ├── test_state.py                   # 9 tests, session store
 ├── test_planner.py                 # 7 tests, TS DB Planner
 ├── test_doctor.py                  # 15 tests, LLM Doctor (fake Anthropic)
@@ -202,7 +215,8 @@ tests/
 ├── test_dashboard.py               # 9 tests, FastAPI endpoints via httpx ASGI client
 ├── test_phase2_exit_criterion.py   # 1 e2e — Phase 2 gate (injected unsafe)
 ├── test_phase3_exit_criterion.py   # 3 e2e — Phase 3 gate (Planner + Doctor unattended)
-└── test_phase4_exit_criterion.py   # 3 e2e — Phase 4 gate (REPLAN + budget + dashboard)
+├── test_phase4_exit_criterion.py   # 3 e2e — Phase 4 gate (REPLAN + budget + dashboard)
+└── test_phase4_2_exit_criterion.py # 3 e2e — Phase 4.2 gate (all four agents in one night)
 ```
 
 ## Tests
@@ -211,7 +225,7 @@ tests/
 py -m pytest tests/ -v
 ```
 
-**146 tests, all green** (Phase 1 in `nina_mcp_server` + Phase 2–4.1 in this repo).
+**156 tests, all green** (Phase 1 in `nina_mcp_server` + Phase 2–4.2 in this repo).
 
 Headline gates:
 - `test_phase2_exit_criterion.py` — injects UNSAFE rain mid-IMAGING; close-down + PANIC alert.
@@ -224,18 +238,12 @@ Headline gates:
 
 ## Next
 
-**Phase 4.2 (carry-over):**
-- Wire **Operator** into the imaging loop — poll NINA's
-  `nina_get_capture_statistics` or subscribe to IMAGE-SAVE events (Phase 1
-  infrastructure already exists in `nina_mcp_server`) and feed each sub's
-  stats to `Operator.evaluate()`.
-- Wire **Scout** into the Conductor's safety/weather tick — emit summaries
-  to the session log and post WARN/ALERT summaries to Discord.
-- Optional LLM second-opinion for both: local Ollama default, Haiku escalation
-  on ambiguous cases (gated by budget circuit breaker).
-
 **Phase 5 — In-NINA panel:**
 - `nina.plugin.aiassistant` mode toggle: Standalone Chat ↔ Connected to Orchestrator.
 - Live status panel + E-STOP inside NINA, mirroring the web dashboard.
+
+**Phase 6 — Lights-out:**
+- Two consecutive unattended nights with no manual intervention.
+- Documentation + monitoring polish.
 
 See the plan file for the full Phase 5–6 rollout.

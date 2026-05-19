@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import aiohttp
 
+from .operator import SubFrameStats
 from .safety import SafetyReading
 
 
@@ -187,6 +188,40 @@ class HttpNinaClient:
 
     async def stop_cooling(self) -> dict[str, Any]:
         return await self._get("equipment/camera/cool?cancel=true")
+
+    async def get_latest_sub_stats(self) -> Optional[dict[str, Any]]:
+        """Fetch the most recent captured sub's stats from NINA's image history.
+
+        Returns {"index": int, "stats": SubFrameStats} or None if no captures yet.
+        The orchestrator tracks `last_sub_index` and only feeds Operator on new subs.
+        """
+        try:
+            raw = await self._get("image-history?count=1")
+        except Exception as e:
+            logger.debug("image-history fetch failed: %s", e)
+            return None
+        images = self._response(raw)
+        # NINA returns the history as a list under various keys depending on version;
+        # accept both common shapes defensively.
+        if isinstance(images, list):
+            entries = images
+        elif isinstance(images, dict):
+            entries = images.get("Images") or images.get("Response") or []
+        else:
+            entries = []
+        if not entries:
+            return None
+        img = entries[-1]
+        index = img.get("Id") or img.get("Index") or img.get("ImageId") or 0
+        stats = SubFrameStats(
+            hfr=_f(img.get("HFR")),
+            star_count=img.get("StarCount") or img.get("Stars"),
+            mean=_f(img.get("Mean")),
+            median=_f(img.get("Median")),
+            filter_name=img.get("Filter") or img.get("FilterName"),
+            exposure_s=_f(img.get("ExposureTime") or img.get("Duration")),
+        )
+        return {"index": int(index), "stats": stats}
 
     async def alert(
         self,

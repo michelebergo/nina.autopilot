@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from .operator import SubFrameStats
 from .safety import SafetyReading
 
 
@@ -35,6 +36,7 @@ class NinaClient(Protocol):
         message: str,
         image_path: Optional[str] = None,
     ) -> dict[str, Any]: ...
+    async def get_latest_sub_stats(self) -> Optional[dict[str, Any]]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,9 @@ class FakeNinaClient:
         self.safety_reading: SafetyReading = SafetyReading()
         self.sequence_state: dict[str, Any] = {"State": "Idle", "Progress": 0}
         self.alerts: list[dict[str, Any]] = []
+        # Sub-stats queue for Operator integration tests. Each get_latest_sub_stats
+        # call pops the first entry (or returns None if empty).
+        self.sub_stats_queue: list[dict[str, Any]] = []
         # Method names that should raise instead of returning normally.
         self.fail_on: set[str] = set()
 
@@ -114,3 +119,9 @@ class FakeNinaClient:
         self._record("alert", severity=severity, message=message, image_path=image_path)
         self.alerts.append({"severity": severity, "message": message, "image_path": image_path})
         return {"Success": True}
+
+    async def get_latest_sub_stats(self) -> Optional[dict[str, Any]]:
+        self._record("get_latest_sub_stats")
+        if self.sub_stats_queue:
+            return self.sub_stats_queue.pop(0)
+        return None
