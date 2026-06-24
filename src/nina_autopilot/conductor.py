@@ -62,6 +62,10 @@ class ConductorConfig:
     max_retries: int = 2  # cap on Doctor RETRY actions before forced abort
     operator: Optional[Any] = None  # any object with `evaluate(SubFrameStats) -> OperatorDecision`
     scout: Optional[Any] = None     # any object with `observe(SafetyReading) -> ScoutSummary`
+    # Seconds to wait after sequence/start before accepting a "done" state.
+    # Prevents the race where NINA hasn't yet flipped containers from CREATED
+    # → RUNNING by the time we poll. 0 disables the gate (tests use this).
+    wait_for_running_seconds: float = 30.0
 
     def __post_init__(self):
         if self.sequence_file is None and self.planner is None:
@@ -92,6 +96,14 @@ class Conductor:
         # Phase 4.2 — Operator / Scout state
         self._last_operator_sub_index: int = -1
         self._scout_obs_count = 0
+        # Wait-for-Running gate (Phase 5.1): ignore "done" states until either
+        # we've seen RUNNING once OR `wait_for_running_seconds` have elapsed.
+        self._imaging_seen_running: bool = False
+        self._imaging_phase_start: float = 0.0
+
+    @staticmethod
+    def _monotonic() -> float:
+        return asyncio.get_event_loop().time()
 
     @property
     def phase(self) -> Phase:
@@ -130,8 +142,29 @@ class Conductor:
             self._transition(Phase.CLOSING)
             return
         await self._client.load_sequence(sequence_name)
+        # NINA's start is a no-op on containers already FINISHED from a previous
+        # run. reset_sequence puts everything back to CREATED so start actually
+        # transitions to RUNNING.
+        await self._safe_call("reset_sequence", self._client.reset_sequence())
         await self._client.start_sequence()
+        self._reset_imaging_gate()
         self._transition(Phase.IMAGING)
+
+    def _reset_imaging_gate(self) -> None:
+        """Reset the wait-for-Running gate for a fresh imaging phase entry."""
+        self._imaging_seen_running = False
+        self._imaging_phase_start = self._monotonic()
+
+    def _can_accept_done(self) -> bool:
+        """Accept "done" states either after we've seen RUNNING once or after
+        the wait_for_running_seconds timeout has elapsed (so a truly broken
+        start eventually surfaces instead of looping forever)."""
+        if self._imaging_seen_running:
+            return True
+        if self._config.wait_for_running_seconds <= 0:
+            return True
+        elapsed = self._monotonic() - self._imaging_phase_start
+        return elapsed >= self._config.wait_for_running_seconds
 
     async def _resolve_sequence(self) -> Optional[str]:
         """Phase 3: invoke Planner if configured. Returns the sequence name to
@@ -153,6 +186,18 @@ class Conductor:
                         "summary": decision.summary,
                         "target": decision.target,
                         "project": decision.project,
+                        # Multi-target chain (astro5 Targets_Container shape): one
+                        # block per actionable target, in imaging order. Empty for
+                        # legacy single-target planners.
+                        "targets": [
+                            {
+                                "project": tp.project,
+                                "target": tp.target,
+                                "plans": tp.plans,
+                                "summary": tp.summary,
+                            }
+                            for tp in decision.targets
+                        ],
                     },
                 )
             if decision.action is PlannerAction.NO_WORK:
@@ -184,13 +229,19 @@ class Conductor:
                 self._transition(Phase.ABORTING)
                 return
 
-            # 3) Sequence state check — completion OR fault
+            # 3) Sequence state check — completion OR fault, with the
+            #    wait-for-Running gate (don't accept "done" until we've seen
+            #    Running once, or the configured timeout has elapsed).
             seq_state = await self._client.get_sequence_state()
             state_name = seq_state.get("State")
+            if state_name == "Running":
+                self._imaging_seen_running = True
             if state_name in _SEQUENCE_DONE_STATES:
-                self._end_reason = "sequence_complete"
-                self._transition(Phase.CLOSING)
-                return
+                if self._can_accept_done():
+                    self._end_reason = "sequence_complete"
+                    self._transition(Phase.CLOSING)
+                    return
+                # Gate still closed — give NINA more time to flip to RUNNING.
             if state_name == _SEQUENCE_ERROR_STATE:
                 continue_imaging = await self._handle_fault(seq_state)
                 if not continue_imaging:
@@ -314,7 +365,9 @@ class Conductor:
         if decision.action is DoctorAction.RETRY:
             # Restart the sequence — NINA's sequencer will re-attempt from the top.
             await self._safe_call("stop_sequence", self._client.stop_sequence())
+            await self._safe_call("reset_sequence", self._client.reset_sequence())
             await self._safe_call("start_sequence", self._client.start_sequence())
+            self._reset_imaging_gate()
             return True  # continue imaging loop
 
         if decision.action is DoctorAction.REPLAN:
@@ -358,7 +411,9 @@ class Conductor:
         # Resume — reset retry counter so the resumed run gets a fresh fault budget.
         self._retry_count = 0
         await self._safe_call("unpark_mount", self._client.unpark_mount())
+        await self._safe_call("reset_sequence", self._client.reset_sequence())
         await self._safe_call("start_sequence", self._client.start_sequence())
+        self._reset_imaging_gate()
         self._record_event("PARK_AND_WAIT_RESUMED", {
             "post_wait_level": post_decision.level.value,
         })
@@ -386,7 +441,9 @@ class Conductor:
         # Fresh sequence — reset the retry counter so the new target gets its own budget
         self._retry_count = 0
         await self._safe_call("load_sequence", self._client.load_sequence(new_sequence))
+        await self._safe_call("reset_sequence", self._client.reset_sequence())
         await self._safe_call("start_sequence", self._client.start_sequence())
+        self._reset_imaging_gate()
         self._record_event("REPLAN_LOADED", {"sequence_name": new_sequence})
         return True  # continue imaging loop
 

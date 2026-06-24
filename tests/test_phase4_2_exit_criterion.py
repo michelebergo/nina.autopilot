@@ -161,7 +161,7 @@ async def test_phase4_2_full_night_with_all_four_agents(tmp_path, ts_db):
         doctor=doctor,
         operator=Operator(),
         scout=Scout(),
-        safety_tick_s=0.0,
+        safety_tick_s=0.0, wait_for_running_seconds=0.0,
     )
     conductor = Conductor(fake, store, cfg)
     await conductor.run()
@@ -234,7 +234,7 @@ async def test_phase4_2_operator_flags_bad_sub_in_log(tmp_path, ts_db):
     cfg = ConductorConfig(
         sequence_file="x.json",
         operator=Operator(),  # default hfr_max=5.0 → 6.5 triggers RESHOOT
-        safety_tick_s=0.0,
+        safety_tick_s=0.0, wait_for_running_seconds=0.0,
     )
     conductor = Conductor(fake, store, cfg)
     await conductor.run()
@@ -265,7 +265,7 @@ async def test_phase4_2_scout_alert_severity_posts_discord(tmp_path):
             return {"State": "Running"}  # never finishes; scout/safety must end it
 
     fake = _SafetyFlipClient()
-    cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0)
+    cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0, wait_for_running_seconds=0.0)
     conductor = Conductor(fake, store, cfg)
     await conductor.run()
 

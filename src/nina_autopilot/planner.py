@@ -48,6 +48,20 @@ class PlannerAction(str, Enum):
 
 
 @dataclass
+class TargetPlan:
+    """One actionable target plus its remaining exposure plans.
+
+    Mirrors a single ``*_Container`` block in a NINA multi-target sequence:
+    a target with coordinates and the per-filter exposure work still owed.
+    """
+
+    project: dict[str, Any]
+    target: dict[str, Any]
+    plans: list[dict[str, Any]] = field(default_factory=list)
+    summary: str = ""
+
+
+@dataclass
 class PlannerDecision:
     action: PlannerAction
     sequence_name: Optional[str] = None
@@ -55,6 +69,9 @@ class PlannerDecision:
     target: Optional[dict[str, Any]] = None
     plans: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
+    # Multi-target: every actionable target in priority order. The first entry
+    # mirrors the single-target fields above for backward compatibility.
+    targets: list[TargetPlan] = field(default_factory=list)
 
 
 # ---- DB readers (intentionally inlined, not imported from nina_mcp_server,
@@ -111,38 +128,32 @@ def _exposure_plans(conn, target_id: int) -> list[dict]:
     return out
 
 
-# ---- Planner entry point -------------------------------------------------
+# ---- Actionable-target collection ----------------------------------------
 
-def plan_next(
-    *,
-    sequence_name: str,
-    ts_db_path: Optional[str] = None,
-    profile_id: Optional[str] = None,
-) -> PlannerDecision:
-    """Walk Target Scheduler projects by priority desc → first actionable target.
+def _collect_actionable(conn, profile_id: Optional[str]) -> list[TargetPlan]:
+    """Walk projects (priority desc) → targets → every actionable target.
 
     'Actionable' = target.active = 1 AND at least one enabled exposure plan
-    with desired > acquired.
+    with desired > acquired. Returns one TargetPlan per actionable target,
+    in the order NINA would image them.
     """
-    conn = _connect_ro(ts_db_path)
-    try:
-        for project in _active_projects(conn, profile_id):
-            for target in _active_targets(conn, project["Id"]):
-                plans = _exposure_plans(conn, target["Id"])
-                actionable = [p for p in plans if p["enabled"] and p["remaining"] > 0]
-                if not actionable:
-                    continue
-                summary_parts = [
-                    f"target={target['name']}",
-                    f"project={project['name']}",
-                ]
-                for p in actionable:
-                    summary_parts.append(
-                        f"{p['filter_name']}×{p['remaining']} ({p['exposure']:.0f}s)"
-                    )
-                return PlannerDecision(
-                    action=PlannerAction.IMAGE,
-                    sequence_name=sequence_name,
+    out: list[TargetPlan] = []
+    for project in _active_projects(conn, profile_id):
+        for target in _active_targets(conn, project["Id"]):
+            plans = _exposure_plans(conn, target["Id"])
+            actionable = [p for p in plans if p["enabled"] and p["remaining"] > 0]
+            if not actionable:
+                continue
+            summary_parts = [
+                f"target={target['name']}",
+                f"project={project['name']}",
+            ]
+            for p in actionable:
+                summary_parts.append(
+                    f"{p['filter_name']}×{p['remaining']} ({p['exposure']:.0f}s)"
+                )
+            out.append(
+                TargetPlan(
                     project={
                         "id": project["Id"],
                         "name": project["name"],
@@ -157,9 +168,81 @@ def plan_next(
                     plans=actionable,
                     summary=" | ".join(summary_parts),
                 )
+            )
+    return out
+
+
+# ---- Planner entry points ------------------------------------------------
+
+def plan_next(
+    *,
+    sequence_name: str,
+    ts_db_path: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> PlannerDecision:
+    """First actionable Target Scheduler target (single-target front door).
+
+    Backward-compatible: populates the flat project/target/plans fields and a
+    one-element ``targets`` list.
+    """
+    conn = _connect_ro(ts_db_path)
+    try:
+        actionable = _collect_actionable(conn, profile_id)
+    finally:
+        conn.close()
+
+    if not actionable:
         return PlannerDecision(
             action=PlannerAction.NO_WORK,
             summary="No actionable Target Scheduler targets",
         )
+
+    first = actionable[0]
+    return PlannerDecision(
+        action=PlannerAction.IMAGE,
+        sequence_name=sequence_name,
+        project=first.project,
+        target=first.target,
+        plans=first.plans,
+        summary=first.summary,
+        targets=[first],
+    )
+
+
+def plan_all(
+    *,
+    sequence_name: str,
+    ts_db_path: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> PlannerDecision:
+    """Every actionable Target Scheduler target, in NINA imaging order.
+
+    Models astro5's ``jan_2026_north_multitarget`` shape: a Targets_Container
+    holding one self-contained block per target. The flat project/target/plans
+    fields mirror the first target for callers that still read them.
+    """
+    conn = _connect_ro(ts_db_path)
+    try:
+        actionable = _collect_actionable(conn, profile_id)
     finally:
         conn.close()
+
+    if not actionable:
+        return PlannerDecision(
+            action=PlannerAction.NO_WORK,
+            summary="No actionable Target Scheduler targets",
+        )
+
+    first = actionable[0]
+    summary = f"{len(actionable)} target(s): " + " → ".join(
+        tp.target["name"] for tp in actionable
+    )
+    return PlannerDecision(
+        action=PlannerAction.IMAGE,
+        sequence_name=sequence_name,
+        project=first.project,
+        target=first.target,
+        plans=first.plans,
+        summary=summary,
+        targets=actionable,
+    )

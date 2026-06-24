@@ -170,9 +170,15 @@ class LLMClient:
         return max(self._nightly_budget_usd - self._cost_total_usd, 0.0)
 
     def budget_snapshot(self) -> dict[str, Any]:
+        # `remaining_usd` is None when no cap is set — `Infinity` is not valid
+        # JSON and breaks strict deserializers (e.g. C# Newtonsoft).
+        remaining: Any = (
+            None if self._nightly_budget_usd is None
+            else max(self._nightly_budget_usd - self._cost_total_usd, 0.0)
+        )
         return {
             "budget_usd": self._nightly_budget_usd,
             "spent_usd": self._cost_total_usd,
-            "remaining_usd": self.budget_remaining_usd(),
+            "remaining_usd": remaining,
             "state": self.budget_state.value,
         }

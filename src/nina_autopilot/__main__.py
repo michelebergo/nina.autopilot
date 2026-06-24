@@ -3,6 +3,7 @@
 Modes:
   python -m nina_autopilot                  # Phase 3 — Planner picks target from TS DB
   python -m nina_autopilot --sequence X.json # Phase 2 — load named sequence
+  python -m nina_autopilot --build-sequence  # Multi-target: plan_all → write JSON → load
   python -m nina_autopilot --no-dashboard   # skip web UI (headless)
   python -m nina_autopilot --no-doctor      # skip LLM Doctor (rule-only behaviour)
 
@@ -26,7 +27,8 @@ from .dashboard import create_app
 from .doctor import Doctor
 from .http_client import HttpNinaClient
 from .llm import LLMClient
-from .planner import plan_next
+from .planner import plan_all, plan_next
+from .sequence_builder import SequenceBuildConfig, write_sequence
 from .state import open_store
 
 
@@ -67,8 +69,30 @@ async def _run(args: argparse.Namespace) -> int:
         doctor = Doctor(llm=llm, model=args.doctor_model)
 
     # Planner — used unless --sequence overrides it.
+    # In --build-sequence mode, plan_all() feeds the sequence builder.
     planner_fn = None
-    if not args.sequence:
+    built_sequence_name: str | None = None
+    if args.build_sequence:
+        decision = plan_all(
+            sequence_name=args.ts_sequence_name,
+            ts_db_path=cfg.ts_db_path,
+            profile_id=cfg.ts_profile_id,
+        )
+        if decision.action.value == "no_work":
+            logger.info("Planner found no actionable targets — nothing to build.")
+            return 0
+        build_cfg = SequenceBuildConfig(sequences_dir=args.sequences_dir)
+        out_path = write_sequence(decision, args.ts_sequence_name, build_cfg)
+        built_sequence_name = out_path.stem  # NINA loads by name without .json
+        logger.info(
+            "Built multi-target sequence '%s' with %d target(s): %s",
+            built_sequence_name,
+            len(decision.targets),
+            decision.summary,
+        )
+        # Use the built sequence as the conductor's sequence_file
+        planner_fn = None
+    elif not args.sequence:
         planner_fn = partial(
             plan_next,
             sequence_name=args.ts_sequence_name,
@@ -85,7 +109,7 @@ async def _run(args: argparse.Namespace) -> int:
             client,
             store,
             ConductorConfig(
-                sequence_file=args.sequence,
+                sequence_file=built_sequence_name or args.sequence,
                 planner=planner_fn,
                 doctor=doctor,
                 safety_tick_s=cfg.safety_tick_s,
@@ -101,6 +125,15 @@ async def _run(args: argparse.Namespace) -> int:
 
         try:
             await conductor.run()
+            if dashboard_server is not None and args.keep_alive_seconds > 0:
+                logger.info(
+                    "session done — keeping dashboard alive at http://%s:%d for %ds (Ctrl-C to exit)",
+                    cfg.dashboard_host, cfg.dashboard_port, args.keep_alive_seconds,
+                )
+                try:
+                    await asyncio.sleep(args.keep_alive_seconds)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    logger.info("keep-alive interrupted, shutting down")
         finally:
             if dashboard_server is not None:
                 dashboard_server.should_exit = True
@@ -114,6 +147,19 @@ def main() -> None:
     parser.add_argument(
         "--sequence", default=None,
         help="Phase 2 mode: skip Planner, load a named NINA sequence directly.",
+    )
+    parser.add_argument(
+        "--build-sequence", action="store_true",
+        help=(
+            "Multi-target mode: run plan_all() to collect every actionable "
+            "Target Scheduler target, build a NINA sequence JSON (Start → "
+            "Targets → End containers), write it to the sequences dir, and "
+            "load it into NINA."
+        ),
+    )
+    parser.add_argument(
+        "--sequences-dir", default=None,
+        help="Override the NINA sequences directory (default: %LOCALAPPDATA%\\NINA\\Sequences).",
     )
     parser.add_argument(
         "--ts-sequence-name", default="autopilot_ts_sequence",
@@ -130,6 +176,15 @@ def main() -> None:
     parser.add_argument(
         "--doctor-model", default="claude-sonnet-4-6",
         help="Anthropic model the Doctor uses.",
+    )
+    parser.add_argument(
+        "--keep-alive-seconds", type=int, default=0,
+        help=(
+            "After the session ends, keep the dashboard alive for N seconds "
+            "(useful for inspecting the final state in a browser or letting "
+            "the in-NINA panel connect for UI testing without a live session). "
+            "Default 0 = exit immediately."
+        ),
     )
     args = parser.parse_args()
     rc = asyncio.run(_run(args))

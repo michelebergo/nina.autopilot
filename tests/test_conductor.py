@@ -24,7 +24,7 @@ def fake():
 
 
 def make_conductor(fake, store, sequence_file="tonight.json"):
-    cfg = ConductorConfig(sequence_file=sequence_file, safety_tick_s=0.0)
+    cfg = ConductorConfig(sequence_file=sequence_file, safety_tick_s=0.0, wait_for_running_seconds=0.0)
     return Conductor(fake, store, cfg)
 
 
@@ -41,8 +41,12 @@ class TestCleanRun:
         await c.run()
 
         calls = fake.call_names()
-        assert calls[0] == "load_sequence"
-        assert calls[1] == "start_sequence"
+        # Three startup calls in order: load → reset → start.
+        # (reset_sequence is between them since NINA needs containers CREATED before start.)
+        assert "load_sequence" in calls
+        assert "reset_sequence" in calls
+        assert "start_sequence" in calls
+        assert calls.index("load_sequence") < calls.index("reset_sequence") < calls.index("start_sequence")
         # load_sequence kwargs include the filename
         load_call = next(c for c in fake.calls if c.method == "load_sequence")
         assert load_call.kwargs["name"] == "my_target.json"
@@ -214,7 +218,7 @@ class TestPlannerIntegration:
         cfg = ConductorConfig(
             sequence_file="fallback.json",
             planner=planner,
-            safety_tick_s=0.0,
+            safety_tick_s=0.0, wait_for_running_seconds=0.0,
         )
         c = Conductor(fake, store, cfg)
         await c.run()
@@ -233,7 +237,7 @@ class TestPlannerIntegration:
         cfg = ConductorConfig(
             sequence_file="ignored.json",
             planner=planner,
-            safety_tick_s=0.0,
+            safety_tick_s=0.0, wait_for_running_seconds=0.0,
         )
         c = Conductor(fake, store, cfg)
         await c.run()
@@ -262,7 +266,7 @@ class TestPlannerIntegration:
         cfg = ConductorConfig(
             sequence_file="fallback.json",
             planner=planner,
-            safety_tick_s=0.0,
+            safety_tick_s=0.0, wait_for_running_seconds=0.0,
         )
         c = Conductor(fake, store, cfg)
         await c.run()
@@ -286,7 +290,7 @@ class TestPlannerIntegration:
                 summary="x",
             )
 
-        cfg = ConductorConfig(sequence_file="fallback.json", planner=planner, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="fallback.json", planner=planner, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
         load_call = next(call for call in fake.calls if call.method == "load_sequence")
@@ -338,7 +342,7 @@ class TestDoctorIntegration:
         cfg = ConductorConfig(
             sequence_file="x.json",
             doctor=doctor,
-            safety_tick_s=0.0,
+            safety_tick_s=0.0, wait_for_running_seconds=0.0,
         )
         c = Conductor(fake, store, cfg)
         await c.run()
@@ -355,7 +359,7 @@ class TestDoctorIntegration:
         doctor = _StubDoctor([
             DoctorDecision(action=DoctorAction.RETRY, reason="first failure"),
         ])
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -371,7 +375,7 @@ class TestDoctorIntegration:
         doctor = _StubDoctor([
             DoctorDecision(action=DoctorAction.ABORT, reason="non-recoverable"),
         ])
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -396,7 +400,7 @@ class TestDoctorIntegration:
         cfg = ConductorConfig(
             sequence_file="x.json",
             doctor=doctor,
-            safety_tick_s=0.0,
+            safety_tick_s=0.0, wait_for_running_seconds=0.0,
             max_retries=2,
         )
         c = Conductor(fake, store, cfg)
@@ -413,7 +417,7 @@ class TestDoctorIntegration:
         doctor = _StubDoctor([
             DoctorDecision(action=DoctorAction.RETRY, reason="hiccup"),
         ])
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -459,7 +463,7 @@ class TestReplanHandler:
         doctor = _StubDoctor([
             DoctorDecision(action=DoctorAction.REPLAN, reason="target A unreachable"),
         ])
-        cfg = ConductorConfig(planner=planner, doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(planner=planner, doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -485,7 +489,7 @@ class TestReplanHandler:
         doctor = _StubDoctor([
             DoctorDecision(action=DoctorAction.REPLAN, reason="give up on A"),
         ])
-        cfg = ConductorConfig(planner=planner, doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(planner=planner, doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -503,7 +507,7 @@ class TestReplanHandler:
         doctor = _StubDoctor([
             DoctorDecision(action=DoctorAction.REPLAN, reason="want a different target"),
         ])
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -556,7 +560,7 @@ class TestParkAndWaitHandler:
         async def fake_sleep(s):
             slept.append(s)
 
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg, sleep=fake_sleep)
         await c.run()
 
@@ -584,7 +588,7 @@ class TestParkAndWaitHandler:
         async def fake_sleep(s):
             pass
 
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg, sleep=fake_sleep)
         await c.run()
 
@@ -610,7 +614,7 @@ class TestParkAndWaitHandler:
         slept = []
         async def fake_sleep(s):
             slept.append(s)
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg, sleep=fake_sleep)
         await c.run()
         assert 300.0 in slept  # default park_and_wait duration
@@ -622,7 +626,7 @@ class TestParkAndWaitHandler:
             DoctorDecision(action=DoctorAction.PARK_AND_WAIT, reason="x", retry_after_s=10),
         ])
         async def fake_sleep(s): pass
-        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg, sleep=fake_sleep)
         await c.run()
         kinds = [e["kind"] for e in store.list_events(1)]
@@ -664,7 +668,7 @@ class TestOperatorIntegration:
         cfg = ConductorConfig(
             sequence_file="x.json",
             operator=Operator(),
-            safety_tick_s=0.0,
+            safety_tick_s=0.0, wait_for_running_seconds=0.0,
         )
         c = Conductor(fake, store, cfg)
         await c.run()
@@ -681,7 +685,7 @@ class TestOperatorIntegration:
         fake.sub_stats_queue = [
             {"index": 42, "stats": SubFrameStats(hfr=6.0, star_count=900)},
         ]
-        cfg = ConductorConfig(sequence_file="x.json", operator=Operator(), safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", operator=Operator(), safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -713,7 +717,7 @@ class TestOperatorIntegration:
                 return {"index": 7, "stats": SubFrameStats(hfr=2.5, star_count=500)}
 
         fake = _StaleSubClient()
-        cfg = ConductorConfig(sequence_file="x.json", operator=Operator(), safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", operator=Operator(), safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -728,7 +732,7 @@ class TestOperatorIntegration:
             {"index": 1, "stats": SubFrameStats(hfr=2.4)},
             {"index": 2, "stats": SubFrameStats(hfr=2.5)},
         ]
-        cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -754,7 +758,7 @@ class TestScoutIntegration:
                 return SafetyReading(cloud_cover_pct=70.0)
 
         fake = _ChangingSafetyClient()
-        cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -784,7 +788,7 @@ class TestScoutIntegration:
                 return {"State": "Running"}  # never finishes — scout/safety must end it
 
         fake = _RainAppearsClient()
-        cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", scout=Scout(), safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
@@ -798,9 +802,144 @@ class TestScoutIntegration:
     async def test_no_scout_means_no_scout_events(self, store):
         fake = FakeNinaClient()
         fake.sequence_state = {"State": "Finished"}
-        cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0)
+        cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0, wait_for_running_seconds=0.0)
         c = Conductor(fake, store, cfg)
         await c.run()
 
         kinds = [e["kind"] for e in store.list_events(1)]
         assert "SCOUT_SUMMARY" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.1 — Sequence-start handshake (reset + wait-for-Running gate)
+# ---------------------------------------------------------------------------
+
+class _ScriptedSequenceStateClient(FakeNinaClient):
+    """Fake that returns scripted sequence_state values on each poll.
+
+    Lets a test express "first poll Finished, second Finished, third Running,
+    fourth Finished" or similar — needed to exercise the gate (NINA's real
+    behaviour after sequence/start: stale FINISHED for a few millis, then
+    RUNNING, then FINISHED at end).
+    """
+
+    def __init__(self, states):
+        super().__init__()
+        from collections import deque
+        self._states = deque(states)
+
+    async def get_sequence_state(self):
+        self._record("get_sequence_state")
+        if not self._states:
+            return {"State": "Finished"}  # default tail
+        return self._states.popleft()
+
+
+class TestImagingHandshake:
+    async def test_reset_sequence_called_before_load(self, fake, store):
+        """The Conductor must call reset_sequence BEFORE start_sequence.
+
+        Order: load → reset → start (load first because reset is no-op without
+        a loaded sequence in some NINA versions; reset before start is the
+        critical bit — without it NINA's sequence/start is a no-op on already-
+        FINISHED containers from the previous run).
+        """
+        fake.sequence_state = {"State": "Finished"}
+        c = make_conductor(fake, store, sequence_file="x.json")
+        await c.run()
+
+        calls = fake.call_names()
+        assert "reset_sequence" in calls
+        assert "load_sequence" in calls
+        assert "start_sequence" in calls
+        assert calls.index("reset_sequence") < calls.index("start_sequence"), (
+            "reset_sequence must be called BEFORE start_sequence — otherwise "
+            "NINA's start is a no-op on FINISHED containers"
+        )
+
+    async def test_finished_before_running_with_wait_keeps_polling(self, store):
+        """If sequence/state reports Finished before we've ever seen Running,
+        and the wait_for_running gate is still open, the Conductor must keep
+        polling (not exit IMAGING immediately)."""
+        fake = _ScriptedSequenceStateClient([
+            # First poll right after start: stale FINISHED from previous run.
+            {"State": "Finished"},
+            {"State": "Finished"},
+            # NINA finally flips to Running.
+            {"State": "Running"},
+            # Sequence runs a couple ticks.
+            {"State": "Running"},
+            # Finally truly finishes.
+            {"State": "Finished"},
+        ])
+        cfg = ConductorConfig(
+            sequence_file="x.json",
+            safety_tick_s=0.0,
+            wait_for_running_seconds=60.0,  # generous, gate stays open
+        )
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        # Must reach DONE via sequence_complete (not abort)
+        assert c.phase is Phase.DONE
+        sess = store.get_session(1)
+        assert sess["end_reason"] == "sequence_complete"
+        # And must have actually polled multiple times — the early "Finished"
+        # responses got ignored by the gate.
+        assert fake.call_names().count("get_sequence_state") >= 4
+
+    async def test_finished_before_running_after_timeout_aborts(self, store, monkeypatch):
+        """If the wait_for_running timeout elapses with no Running seen ever,
+        the Conductor must give up and abort — otherwise a truly broken start
+        would loop forever."""
+        # Sequence/state always reports Finished, never Running.
+        fake = _ScriptedSequenceStateClient([
+            {"State": "Finished"},
+        ] * 50)
+
+        # Make monotonic() return increasing values so the elapsed timeout
+        # is reached quickly: each tick of our fake sleep advances by 1s.
+        clock = [0.0]
+
+        async def fake_sleep(s):
+            clock[0] += s if s > 0 else 0.1  # advance even on 0s tick
+
+        # Inject the fake clock — pytest.monkeypatch handles restore correctly
+        # (manual save/restore breaks the staticmethod descriptor).
+        import nina_autopilot.conductor as cmod
+        monkeypatch.setattr(cmod.Conductor, "_monotonic", staticmethod(lambda: clock[0]))
+
+        cfg = ConductorConfig(
+            sequence_file="x.json",
+            safety_tick_s=0.5,  # each tick advances clock by 0.5s
+            wait_for_running_seconds=1.0,  # gate expires after 1s elapsed
+        )
+        c = Conductor(fake, store, cfg, sleep=fake_sleep)
+        await c.run()
+
+        # Once timeout elapses, the Finished state is accepted → sequence_complete
+        # OR the Conductor times out into an aborted state. The contract: it
+        # must exit the imaging loop instead of polling forever.
+        assert c.phase is Phase.DONE
+        # Time advanced — the loop didn't run forever
+        assert clock[0] >= 1.0
+
+    async def test_running_seen_then_finished_completes_normally(self, store):
+        """The normal happy path: state goes Running → Running → Finished.
+        Conductor completes cleanly with end_reason=sequence_complete."""
+        fake = _ScriptedSequenceStateClient([
+            {"State": "Running"},
+            {"State": "Running"},
+            {"State": "Finished"},
+        ])
+        cfg = ConductorConfig(
+            sequence_file="x.json",
+            safety_tick_s=0.0,
+            wait_for_running_seconds=30.0,  # gate active but irrelevant on happy path
+        )
+        c = Conductor(fake, store, cfg)
+        await c.run()
+
+        assert c.phase is Phase.DONE
+        sess = store.get_session(1)
+        assert sess["end_reason"] == "sequence_complete"

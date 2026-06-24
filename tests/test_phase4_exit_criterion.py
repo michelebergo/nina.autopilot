@@ -137,7 +137,7 @@ async def test_phase4_full_replan_with_budget_and_dashboard(tmp_path, ts_db_two_
     cfg = ConductorConfig(
         planner=planner_fn,
         doctor=doctor,
-        safety_tick_s=0.0,
+        safety_tick_s=0.0, wait_for_running_seconds=0.0,
     )
     conductor = Conductor(fake_nina, store, cfg)
 
@@ -217,7 +217,7 @@ async def test_phase4_budget_halt_blocks_further_doctor_calls(tmp_path, ts_db_tw
     assert llm.budget_state is BudgetState.HALTED
 
     doctor = Doctor(llm=llm, model="claude-sonnet-4-6")
-    cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0)
+    cfg = ConductorConfig(sequence_file="x.json", doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
     conductor = Conductor(fake_nina, store, cfg)
 
     # Conductor should still complete (Doctor call raises BudgetExceeded → caught → ABORT)
@@ -241,7 +241,7 @@ async def test_phase4_estop_via_dashboard_stops_running_conductor(tmp_path):
             return {"State": "Running"}
 
     fake_nina = _LoopingClient()
-    cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.001)
+    cfg = ConductorConfig(sequence_file="x.json", safety_tick_s=0.0, wait_for_running_seconds=0.001)
     conductor = Conductor(fake_nina, store, cfg)
     app = create_app(conductor=conductor, store=store)
 

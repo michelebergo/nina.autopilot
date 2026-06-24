@@ -17,6 +17,7 @@ import pytest
 from nina_autopilot.planner import (
     PlannerAction,
     PlannerDecision,
+    plan_all,
     plan_next,
 )
 
@@ -186,3 +187,43 @@ class TestPlannerDecisionShape:
         assert len(d.plans) == 1
         assert d.plans[0]["template_name"] == "L"
         assert d.plans[0]["remaining"] == 20
+
+    def test_plan_next_populates_single_element_targets_list(self, seeded_ts_db):
+        d = plan_next(ts_db_path=str(seeded_ts_db), sequence_name="x.json")
+        assert len(d.targets) == 1
+        assert d.targets[0].target["name"] == "M81 Galaxy"
+
+
+class TestPlannerMultiTarget:
+    """plan_all() mirrors astro5's multi-target Targets_Container shape:
+    one self-contained block per actionable target, in imaging order."""
+
+    def test_empty_db_returns_no_work(self, empty_ts_db):
+        d = plan_all(ts_db_path=str(empty_ts_db), sequence_name="x.json")
+        assert d.action is PlannerAction.NO_WORK
+        assert d.targets == []
+
+    def test_collects_all_actionable_targets_in_priority_order(self, seeded_ts_db):
+        d = plan_all(ts_db_path=str(seeded_ts_db), sequence_name="x.json")
+        assert d.action is PlannerAction.IMAGE
+        names = [tp.target["name"] for tp in d.targets]
+        # M81 (priority 100) before NGC 7000 (priority 50); Drafty (draft) excluded
+        assert names == ["M81 Galaxy", "NGC 7000 Nebula"]
+
+    def test_flat_fields_mirror_first_target(self, seeded_ts_db):
+        d = plan_all(ts_db_path=str(seeded_ts_db), sequence_name="x.json")
+        assert d.target["name"] == "M81 Galaxy"
+        assert d.project["name"] == "M81"
+        assert d.plans == d.targets[0].plans
+
+    def test_summary_lists_target_chain(self, seeded_ts_db):
+        d = plan_all(ts_db_path=str(seeded_ts_db), sequence_name="x.json")
+        assert "2 target(s)" in d.summary
+        assert "M81 Galaxy" in d.summary
+        assert "NGC 7000 Nebula" in d.summary
+
+    def test_each_target_block_carries_its_own_plans(self, seeded_ts_db):
+        d = plan_all(ts_db_path=str(seeded_ts_db), sequence_name="x.json")
+        ngc = next(tp for tp in d.targets if tp.target["name"] == "NGC 7000 Nebula")
+        assert len(ngc.plans) == 1
+        assert ngc.plans[0]["remaining"] == 50  # 50 desired - 0 acquired

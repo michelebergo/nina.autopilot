@@ -135,7 +135,7 @@ async def test_phase3_full_night_with_synthetic_fault_zero_human_intervention(tm
     cfg = ConductorConfig(
         planner=planner,
         doctor=doctor,
-        safety_tick_s=0.0,
+        safety_tick_s=0.0, wait_for_running_seconds=0.0,
         max_retries=2,
     )
     conductor = Conductor(fake_nina, store, cfg)
@@ -207,7 +207,7 @@ async def test_phase3_doctor_abort_decision_ends_session_cleanly(tmp_path, ts_db
         plan_next, ts_db_path=str(ts_db),
         sequence_name="x.json", profile_id=PROFILE,
     )
-    cfg = ConductorConfig(planner=planner, doctor=doctor, safety_tick_s=0.0)
+    cfg = ConductorConfig(planner=planner, doctor=doctor, safety_tick_s=0.0, wait_for_running_seconds=0.0)
     conductor = Conductor(fake_nina, store, cfg)
     await conductor.run()
 
@@ -233,7 +233,7 @@ async def test_phase3_no_work_session_ends_without_load(tmp_path, tmp_path_facto
     fake_nina = FakeNinaClient()
 
     planner = partial(plan_next, ts_db_path=str(empty_db), sequence_name="x.json")
-    cfg = ConductorConfig(planner=planner, safety_tick_s=0.0)
+    cfg = ConductorConfig(planner=planner, safety_tick_s=0.0, wait_for_running_seconds=0.0)
     conductor = Conductor(fake_nina, store, cfg)
     await conductor.run()
 

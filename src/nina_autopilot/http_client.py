@@ -165,11 +165,70 @@ class HttpNinaClient:
         )
 
     async def get_sequence_state(self) -> dict[str, Any]:
+        """Probe NINA for the running sequence's roll-up status.
+
+        NINA's /v2/api/sequence/state returns Response as a *list* of nested
+        containers, each with its own Status (CREATED / RUNNING / FINISHED /
+        SKIPPED). We walk that tree and derive a single Conductor-friendly
+        state string the imaging loop can compare against
+        _SEQUENCE_DONE_STATES.
+
+        Mapping:
+          - any container Status == "RUNNING"   → "Running"
+          - all containers in {FINISHED, SKIPPED} → "Finished"
+          - everything CREATED (sequence never started)         → "Idle"
+          - empty / unknown shape                                → "Unknown"
+        """
         raw = await self._get("sequence/state")
-        return self._response(raw) if isinstance(raw, dict) else {"State": "Unknown"}
+        if not isinstance(raw, dict):
+            return {"State": "Unknown"}
+        response = raw.get("Response")
+        if not isinstance(response, list):
+            # Older API or unwrapped — fall back to legacy behaviour.
+            return self._response(raw) if isinstance(response, dict) else {"State": "Unknown"}
+
+        statuses = self._collect_sequence_statuses(response)
+        if not statuses:
+            return {"State": "Idle", "Raw": response}
+        if any(s == "RUNNING" for s in statuses):
+            state = "Running"
+        elif all(s in {"FINISHED", "SKIPPED"} for s in statuses):
+            state = "Finished"
+        elif all(s in {"CREATED"} for s in statuses):
+            state = "Idle"
+        else:
+            state = "Unknown"
+        return {"State": state, "Raw": response}
+
+    @staticmethod
+    def _collect_sequence_statuses(container_list: Any) -> list[str]:
+        """Recursively walk a NINA sequence-state container tree and collect
+        every Status value found. Containers that are pure metadata wrappers
+        (no Status, e.g. GlobalTriggers) are silently skipped."""
+        out: list[str] = []
+        if not isinstance(container_list, list):
+            return out
+        for c in container_list:
+            if not isinstance(c, dict):
+                continue
+            status = c.get("Status")
+            if isinstance(status, str):
+                out.append(status)
+            items = c.get("Items")
+            if isinstance(items, list):
+                out.extend(HttpNinaClient._collect_sequence_statuses(items))
+        return out
 
     async def load_sequence(self, name: str) -> dict[str, Any]:
         return await self._get(f"sequence/load?sequenceName={quote(name)}")
+
+    async def reset_sequence(self) -> dict[str, Any]:
+        """Reset all sequence containers from FINISHED back to CREATED.
+
+        Required before re-starting a sequence that has already run to
+        completion — NINA's sequence/start is a no-op on FINISHED containers.
+        """
+        return await self._get("sequence/reset")
 
     async def start_sequence(self) -> dict[str, Any]:
         return await self._get("sequence/start")

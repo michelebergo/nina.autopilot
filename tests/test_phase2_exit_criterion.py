@@ -52,7 +52,7 @@ async def test_phase2_exit_criterion_full_close_down_chain(tmp_path):
     conductor = Conductor(
         fake,
         store,
-        ConductorConfig(sequence_file="my_target.json", safety_tick_s=0.0),
+        ConductorConfig(sequence_file="my_target.json", safety_tick_s=0.0, wait_for_running_seconds=0.0),
     )
 
     await conductor.run()
@@ -60,10 +60,14 @@ async def test_phase2_exit_criterion_full_close_down_chain(tmp_path):
     # ---- 1. Final phase is DONE (close-down ran to completion) ----
     assert conductor.phase is Phase.DONE
 
-    # ---- 2. Sequence load+start happened before close-down ----
+    # ---- 2. Sequence reset+load+start happened before close-down ----
+    # (reset_sequence puts NINA's containers back to CREATED so start_sequence
+    # actually transitions to RUNNING — see _phase_starting in conductor.py)
     calls = fake.call_names()
-    assert calls[0] == "load_sequence"
-    assert calls[1] == "start_sequence"
+    assert "load_sequence" in calls
+    assert "reset_sequence" in calls
+    assert "start_sequence" in calls
+    assert calls.index("load_sequence") < calls.index("reset_sequence") < calls.index("start_sequence")
 
     # ---- 3. Close-down chain executed in correct order ----
     close_down_calls = [c for c in calls if c in {
