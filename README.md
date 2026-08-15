@@ -144,6 +144,50 @@ py -m nina_autopilot --doctor-model claude-opus-4-7
 
 The process exits 0 on a clean completion, 1 on FAULT.
 
+### LLM wiki maintenance
+
+The NINA AI plugins (AI Assistant, AI Weather) share a knowledge wiki at
+`%LOCALAPPDATA%\NINA\llmwiki` — plain markdown, Karpathy-style: the plugins
+append immutable observations to `raw/` (daily weather digests, chat notes the
+user asked to remember); this repo's agent consolidates them into `wiki/` pages
+following the wiki's own `SCHEMA.md`.
+
+```bash
+# Consolidate new raw/ observations into wiki pages (run nightly or on demand)
+py -m nina_autopilot --wiki-ingest
+
+# Preview what would be written without touching files (recommended first)
+py -m nina_autopilot --wiki-ingest --wiki-dry-run
+
+# Health check: broken wiki-links, missing frontmatter, contradictions (weekly)
+py -m nina_autopilot --wiki-lint
+```
+
+Backend selection — default is Anthropic (`ANTHROPIC_API_KEY`, model
+`claude-sonnet-4-6`, spend counted against `NIGHTLY_BUDGET_USD`):
+
+```bash
+# Cheaper Anthropic model for small nightly ingests
+py -m nina_autopilot --wiki-ingest --wiki-model claude-haiku-4-5-20251001
+
+# Any OpenAI-compatible server: local Ollama/LM Studio, OpenAI, Mistral,
+# Gemini-compat. Model is required; thinking is disabled automatically.
+py -m nina_autopilot --wiki-ingest --wiki-provider openai-compat --wiki-model gemma4:27b
+py -m nina_autopilot --wiki-ingest --wiki-provider openai-compat \
+    --wiki-base-url http://astro10:11434/v1 --wiki-model gemma4:27b
+```
+
+Or set `LLMWIKI_PROVIDER` / `LLMWIKI_BASE_URL` / `LLMWIKI_MODEL` in `.env` once
+(see `.env.example`).
+
+**A word of caution on local models**: ingest is the hardest LLM task in this
+pipeline — it must tell durable knowledge from one-night noise and merge into
+existing pages without duplicating. Small local models do this poorly, and a
+wrong consolidated page poisons every future answer the in-NINA assistant gives.
+With a local model, always run `--wiki-dry-run` first and read the proposed
+pages; keep real consolidation on a capable model. The openai-compat backend
+has no cost tracking, so the nightly budget breaker does not apply to it.
+
 The dashboard binds to 127.0.0.1 by default. To reach it from a phone/laptop
 while the rig is unattended, run [Tailscale](https://tailscale.com) (or
 WireGuard) on the NINA PC and hit `http://<tailscale-ip>:8765/` — never

@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from functools import partial
+from pathlib import Path
 
 import uvicorn
 
@@ -29,7 +31,9 @@ from .http_client import HttpNinaClient
 from .llm import LLMClient
 from .planner import plan_all, plan_next
 from .sequence_builder import SequenceBuildConfig, write_sequence
+from .llm_openai_compat import OpenAICompatClient
 from .state import open_store
+from .wiki_ingest import run_ingest, run_lint
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,51 @@ async def _serve_dashboard(app, host: str, port: int) -> uvicorn.Server:
         await asyncio.sleep(0.1)
     logger.info("dashboard ready at http://%s:%d/", host, port)
     return server
+
+
+async def _run_wiki(args: argparse.Namespace) -> int:
+    """Wiki maintenance modes — no NINA connection needed."""
+    cfg = load_config()
+    provider = args.wiki_provider or os.getenv("LLMWIKI_PROVIDER", "anthropic")
+    if provider == "anthropic":
+        llm = LLMClient(nightly_budget_usd=cfg.nightly_budget_usd)
+        model = args.wiki_model or "claude-sonnet-4-6"
+    else:  # openai-compat: Ollama / LM Studio / OpenAI / Mistral / Gemini-compat
+        base_url = args.wiki_base_url or os.getenv("LLMWIKI_BASE_URL", "http://localhost:11434/v1")
+        model = args.wiki_model or os.getenv("LLMWIKI_MODEL") or ""
+        if not model:
+            logger.error(
+                "openai-compat provider needs an explicit model: pass --wiki-model "
+                "(e.g. gemma4:27b) or set LLMWIKI_MODEL in .env"
+            )
+            return 2
+        llm = OpenAICompatClient(base_url=base_url)
+        logger.info("wiki: using openai-compat backend at %s, model %s (no budget tracking)", base_url, model)
+    root = Path(args.wiki_root) if args.wiki_root else None
+
+    if args.wiki_ingest:
+        report = await run_ingest(llm, root=root, model=model, dry_run=args.wiki_dry_run)
+        if report.skipped_reason:
+            logger.info("wiki-ingest skipped: %s", report.skipped_reason)
+        else:
+            logger.info(
+                "wiki-ingest: %d raw file(s), %d new line(s) -> wrote %s%s",
+                report.raw_files_processed,
+                report.new_lines,
+                ", ".join(report.pages_written) or "nothing",
+                " (dry run)" if args.wiki_dry_run else "",
+            )
+            if report.log_line:
+                logger.info("wiki-ingest: %s", report.log_line)
+        logger.info("wiki-ingest cost: $%.4f", llm.cost_estimate_usd())
+
+    if args.wiki_lint:
+        report = await run_lint(llm, root=root, model=model)
+        issues = len(report.broken_links) + len(report.missing_frontmatter) + len(report.llm_issues)
+        logger.info("wiki-lint: %d issue(s) — report in wiki/syntheses/lint-report.md", issues)
+        logger.info("wiki-lint cost: $%.4f", llm.cost_estimate_usd())
+
+    return 0
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -178,6 +227,45 @@ def main() -> None:
         help="Anthropic model the Doctor uses.",
     )
     parser.add_argument(
+        "--wiki-ingest", action="store_true",
+        help="Run the LLM wiki ingest (consolidate raw/ observations into wiki pages) and exit.",
+    )
+    parser.add_argument(
+        "--wiki-lint", action="store_true",
+        help="Run the LLM wiki health check (broken links, contradictions) and exit.",
+    )
+    parser.add_argument(
+        "--wiki-dry-run", action="store_true",
+        help="With --wiki-ingest: show what would be written without touching files.",
+    )
+    parser.add_argument(
+        "--wiki-root", default=None,
+        help="Override the wiki root (default: %LOCALAPPDATA%\\NINA\\llmwiki or LLMWIKI_ROOT).",
+    )
+    parser.add_argument(
+        "--wiki-model", default=None,
+        help=(
+            "Model for wiki ingest/lint. Anthropic provider defaults to "
+            "claude-sonnet-4-6; the openai-compat provider requires an explicit "
+            "model (e.g. gemma4:27b) here or in LLMWIKI_MODEL."
+        ),
+    )
+    parser.add_argument(
+        "--wiki-provider", default=None, choices=["anthropic", "openai-compat"],
+        help=(
+            "LLM backend for wiki ingest/lint (default: LLMWIKI_PROVIDER env or "
+            "'anthropic'). 'openai-compat' talks to any /chat/completions server: "
+            "Ollama, LM Studio, OpenAI, Mistral, Gemini-compat."
+        ),
+    )
+    parser.add_argument(
+        "--wiki-base-url", default=None,
+        help=(
+            "Base URL for the openai-compat provider (default: LLMWIKI_BASE_URL "
+            "env or http://localhost:11434/v1 for a local Ollama)."
+        ),
+    )
+    parser.add_argument(
         "--keep-alive-seconds", type=int, default=0,
         help=(
             "After the session ends, keep the dashboard alive for N seconds "
@@ -187,7 +275,10 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    rc = asyncio.run(_run(args))
+    if args.wiki_ingest or args.wiki_lint:
+        rc = asyncio.run(_run_wiki(args))
+    else:
+        rc = asyncio.run(_run(args))
     sys.exit(rc)
 
 
